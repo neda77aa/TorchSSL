@@ -14,19 +14,20 @@ import torch.multiprocessing as mp
 
 from utils import net_builder, get_logger, count_parameters, over_write_args_from_file
 from train_utils import TBLog, get_optimizer, get_cosine_schedule_with_warmup
-from models.fixmatch.fixmatch import FixMatch
+from models.flexmatch.flexmatch import FlexMatch
 from datasets.ssl_dataset import SSL_Dataset, ImageNetLoader
 from datasets.data_utils import get_data_loader
-
+import wandb
 
 def main(args):
     '''
     For (Distributed)DataParallelism,
     main(args) spawn each process (main_worker) to each GPU.
     '''
-
+    # Visible GPUs
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,3,6"
     save_path = os.path.join(args.save_dir, args.save_name)
-    if os.path.exists(save_path) and args.overwrite and args.resume == False:
+    if os.path.exists(save_path) and args.overwrite and  args.resume == False:
         import shutil
         shutil.rmtree(save_path)
     if os.path.exists(save_path) and not args.overwrite:
@@ -103,10 +104,12 @@ def main_worker(gpu, ngpus_per_node, args):
     logger = get_logger(args.save_name, save_path, logger_level)
     logger.warning(f"USE GPU: {args.gpu} for training")
 
-    # SET FixMatch: class FixMatch in models.fixmatch
+    # SET flexmatch: class flexmatch in models.flexmatch
     args.bn_momentum = 1.0 - 0.999
     if 'imagenet' in args.dataset.lower():
         _net_builder = net_builder('ResNet50', False, None, is_remix=False)
+    elif 'as' in args.dataset.lower():
+        _net_builder = net_builder('r2plus1d_18', False, None, is_remix=False)
     else:
         _net_builder = net_builder(args.net,
                                    args.net_from_name,
@@ -120,7 +123,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                     'is_remix': False},
                                    )
 
-    model = FixMatch(_net_builder,
+    model = FlexMatch(_net_builder,
                      args.num_classes,
                      args.ema_m,
                      args.T,
@@ -139,7 +142,7 @@ def main_worker(gpu, ngpus_per_node, args):
     scheduler = get_cosine_schedule_with_warmup(optimizer,
                                                 args.num_train_iter,
                                                 num_warmup_steps=args.num_train_iter * 0)
-    ## set SGD and cosine lr on FixMatch 
+    ## set SGD and cosine lr on flexmatch
     model.set_optimizer(optimizer, scheduler)
 
     # SET Devices for (Distributed) DataParallel
@@ -185,14 +188,22 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.distributed.barrier()
  
     # Construct Dataset & DataLoader
-    if args.dataset != "imagenet":
-        train_dset = SSL_Dataset(args, alg='fixmatch', name=args.dataset, train=True,
+    if args.dataset== "as":
+        from datasets.as_dataset import ASLoader
+        image_loader = ASLoader(alg = 'flexmatch')
+        lb_dset = image_loader.get_lb_train_data()
+        ulb_dset = image_loader.get_ulb_train_data()
+        eval_dset = image_loader.get_lb_val_data()
+        test_dset = image_loader.get_lb_test_data()
+        
+    elif args.dataset.lower() != "imagenet":
+        train_dset = SSL_Dataset(args, alg='flexmatch', name=args.dataset, train=True,
                                 num_classes=args.num_classes, data_dir=args.data_dir)
         lb_dset, ulb_dset = train_dset.get_ssl_dset(args.num_labels)
-
-        _eval_dset = SSL_Dataset(args, alg='fixmatch', name=args.dataset, train=False,
+        _eval_dset = SSL_Dataset(args, alg='flexmatch', name=args.dataset, train=False,
                                 num_classes=args.num_classes, data_dir=args.data_dir)
         eval_dset = _eval_dset.get_dset()
+        
     else:
         image_loader = ImageNetLoader(root_path=args.data_dir, num_labels=args.num_labels,
                                       num_class=args.num_classes)
@@ -201,7 +212,8 @@ def main_worker(gpu, ngpus_per_node, args):
         eval_dset = image_loader.get_lb_test_data()
     if args.rank == 0 and args.distributed:
         torch.distributed.barrier()
-                            
+ 
+    
     loader_dict = {}
     dset_dict = {'train_lb': lb_dset, 'train_ulb': ulb_dset, 'eval': eval_dset}
 
@@ -213,7 +225,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                               distributed=args.distributed)
 
     loader_dict['train_ulb'] = get_data_loader(dset_dict['train_ulb'],
-                                               args.batch_size * args.uratio,
+                                               int(args.batch_size * args.uratio),
                                                data_sampler=args.train_sampler,
                                                num_iters=args.num_train_iter,
                                                num_workers=4 * args.num_workers,
@@ -224,16 +236,25 @@ def main_worker(gpu, ngpus_per_node, args):
                                           num_workers=args.num_workers,
                                           drop_last=False)
 
-    ## set DataLoader on FixMatch
+    ## set DataLoader and ulb_dset on FlexMatch
     model.set_data_loader(loader_dict)
+
     model.set_dset(ulb_dset)
+
     # If args.resume, load checkpoints from args.load_path
     if args.resume:
         model.load_model(args.load_path)
 
     # START TRAINING of FixMatch
+    if args.wandb:
+        import wandb
+        run = wandb.init(project="SSL", entity="asproject",group="SSL_flexmatch" )
+        wandb.run.config.update(args) 
+        
     trainer = model.train
     for epoch in range(args.epoch):
+        if args.wandb:
+            wandb.log({'epoch':epoch})
         trainer(args, logger=logger)
 
     if not args.multiprocessing_distributed or \
@@ -256,6 +277,7 @@ def str2bool(v):
 
 if __name__ == "__main__":
     import argparse
+    import wandb
 
     parser = argparse.ArgumentParser(description='')
 
@@ -263,16 +285,16 @@ if __name__ == "__main__":
     Saving & loading of the model.
     '''
     parser.add_argument('--save_dir', type=str, default='./saved_models')
-    parser.add_argument('-sn', '--save_name', type=str, default='fixmatch')
+    parser.add_argument('-sn', '--save_name', type=str, default='flexmatch')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--load_path', type=str, default=None)
     parser.add_argument('-o', '--overwrite', action='store_true')
     parser.add_argument('--use_tensorboard', action='store_true', help='Use tensorboard to plot and save curves, otherwise save the curves locally.')
 
     '''
-    Training Configuration of FixMatch
+    Training Configuration of flexmatch
     '''
-
+    parser.add_argument('--wandb', type=str2bool, default=False)
     parser.add_argument('--epoch', type=int, default=1)
     parser.add_argument('--num_train_iter', type=int, default=2 ** 20,
                         help='total number of training iterations')
@@ -290,6 +312,8 @@ if __name__ == "__main__":
     parser.add_argument('--p_cutoff', type=float, default=0.95)
     parser.add_argument('--ema_m', type=float, default=0.999, help='ema momentum for eval_model')
     parser.add_argument('--ulb_loss_ratio', type=float, default=1.0)
+    parser.add_argument('--use_DA', type=str2bool, default=False)
+    parser.add_argument('-w', '--thresh_warmup', type=str2bool, default=True)
 
     '''
     Optimizer configurations
@@ -329,7 +353,7 @@ if __name__ == "__main__":
                         help='number of nodes for distributed training')
     parser.add_argument('--rank', default=0, type=int,
                         help='**node rank** for distributed training')
-    parser.add_argument('-du', '--dist-url', default='tcp://127.0.0.1:11111', type=str,
+    parser.add_argument('-du', '--dist-url', default='tcp://127.0.0.1:10601', type=str,
                         help='url used to set up distributed training')
     parser.add_argument('--dist-backend', default='nccl', type=str,
                         help='distributed backend')
@@ -348,3 +372,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     over_write_args_from_file(args, args.c)
     main(args)
+    if args.wandb:
+        wandb.finish()
