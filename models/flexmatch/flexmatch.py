@@ -17,6 +17,8 @@ from train_utils import ce_loss, wd_loss, EMA, Bn_Controller
 
 from sklearn.metrics import *
 from copy import deepcopy
+import tqdm 
+import wandb
 
 
 class FlexMatch:
@@ -80,7 +82,6 @@ class FlexMatch:
         self.scheduler = scheduler
 
     def train(self, args, logger=None):
-
         ngpus_per_node = torch.cuda.device_count()
 
         # EMA Init
@@ -93,6 +94,8 @@ class FlexMatch:
         # p(y) based on the labeled examples seen during training
         dist_file_name = r"./data_statistics/" + args.dataset + '_' + str(args.num_labels) + '.json'
         if args.dataset.upper() == 'IMAGENET':
+            p_target = None
+        elif args.dataset.lower()=='as':
             p_target = None
         else:
             with open(dist_file_name, 'r') as f:
@@ -124,10 +127,12 @@ class FlexMatch:
         selected_label = selected_label.cuda(args.gpu)
 
         classwise_acc = torch.zeros((args.num_classes,)).cuda(args.gpu)
-
-        for (_, x_lb, y_lb), (x_ulb_idx, x_ulb_w, x_ulb_s) in zip(self.loader_dict['train_lb'],
-                                                                  self.loader_dict['train_ulb']):
-            # prevent the training iterations exceed args.num_train_iter
+        
+        print('Training Started:')
+        for (_, x_lb, y_lb), (x_ulb_idx, x_ulb_w, x_ulb_s) in tqdm.tqdm(zip(self.loader_dict['train_lb'],
+                                self.loader_dict['train_ulb']),total = len(self.loader_dict['train_lb'])):
+            
+            # prevent the aining iterations exceed args.num_train_iter
             if self.it > args.num_train_iter:
                 break
 
@@ -181,6 +186,8 @@ class FlexMatch:
                     selected_label[x_ulb_idx[select == 1]] = pseudo_lb[select == 1]
 
                 total_loss = sup_loss + self.lambda_u * unsup_loss
+                if (args.wandb and self.it%100 == 0):
+                    wandb.log({'train_loss':total_loss})
 
             # parameter updates
             if args.amp:
@@ -241,7 +248,7 @@ class FlexMatch:
             del tb_dict
             start_batch.record()
             if self.it > 0.8 * args.num_train_iter:
-                self.num_eval_iter = 1000
+                self.num_eval_iter = 500
 
         eval_dict = self.evaluate(args=args)
         eval_dict.update({'eval/best_acc': best_eval_acc, 'eval/best_it': best_it})
@@ -258,7 +265,8 @@ class FlexMatch:
         y_true = []
         y_pred = []
         y_logits = []
-        for _, x, y in eval_loader:
+        print('Validation Started:')
+        for _, x, y in tqdm.tqdm(eval_loader):
             x, y = x.cuda(args.gpu), y.cuda(args.gpu)
             num_batch = x.shape[0]
             total_num += num_batch
@@ -278,6 +286,11 @@ class FlexMatch:
         self.print_fn('confusion matrix:\n' + np.array_str(cf_mat))
         self.ema.restore()
         self.model.train()
+        if args.wandb:
+            print('loging to wandb')
+            wandb.log({'eval/loss': total_loss / total_num, 'eval/top-1-acc': top1,'eval/precision': 
+                       precision, 'eval/recall': recall, 'eval/F1': F1, 'eval/AUC': AUC})
+            print('loging finished')
         return {'eval/loss': total_loss / total_num, 'eval/top-1-acc': top1, 'eval/top-5-acc': top5,
                 'eval/precision': precision, 'eval/recall': recall, 'eval/F1': F1, 'eval/AUC': AUC}
 
